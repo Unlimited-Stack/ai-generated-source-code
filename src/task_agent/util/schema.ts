@@ -5,6 +5,7 @@ export const TASK_STATUS_VALUES = [
   "Searching",
   "Negotiating",
   "Waiting_Human",
+  "Listening",
   "Revising",
   "Closed",
   "Failed",
@@ -35,20 +36,20 @@ export const TaskFrontmatterSchema = z.object({
   task_id: z.string().min(1),
   status: TaskStatusSchema,
   interaction_type: InteractionTypeSchema,
-  must_match_tags: z.array(z.string()),
-  deal_breakers: z.array(z.string()),
   current_partner_id: z.string().nullable(),
   entered_status_at: z.string().datetime(),
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
   version: z.number().int().nonnegative(),
-  pending_sync: z.boolean()
+  pending_sync: z.boolean(),
+  hidden: z.boolean().default(false)
 });
 
 export const TaskBodySchema = z.object({
   rawDescription: z.string().min(1),
   targetActivity: z.string().min(1),
-  targetVibe: z.string().min(1)
+  targetVibe: z.string().min(1),
+  detailedPlan: z.string().default("")
 });
 
 export const TaskDocumentSchema = z.object({
@@ -62,8 +63,6 @@ export type TaskDocument = z.infer<typeof TaskDocumentSchema>;
 
 export const HandshakePayloadSchema = z.object({
   interaction_type: InteractionTypeSchema,
-  must_match_tags: z.array(z.string()),
-  deal_breakers: z.array(z.string()),
   target_activity: z.string().min(1),
   target_vibe: z.string().min(1)
 });
@@ -122,6 +121,44 @@ export const L1CandidateSchema = z.object({
 
 export type L0Candidate = z.infer<typeof L0CandidateSchema>;
 export type L1Candidate = z.infer<typeof L1CandidateSchema>;
+
+export const SESSION_STATUS_VALUES = [
+  "Negotiating",
+  "Accepted",
+  "Rejected",
+  "Timeout"
+] as const;
+
+export const SessionStatusSchema = z.enum(SESSION_STATUS_VALUES);
+export type SessionStatus = z.infer<typeof SessionStatusSchema>;
+
+export const NegotiationSessionSchema = z.object({
+  session_id: z.string().min(1),
+  task_id: z.string().min(1),
+  remote_agent_id: z.string().min(1),
+  remote_task_id: z.string().min(1),
+  status: SessionStatusSchema,
+  match_score: z.number().nullable(),
+  l2_action: z.enum(["ACCEPT", "REJECT"]).nullable(),
+  rounds: z.number().int().nonnegative(),
+  started_at: z.string().datetime(),
+  updated_at: z.string().datetime(),
+  timeout_at: z.string().datetime()
+});
+
+export type NegotiationSession = z.infer<typeof NegotiationSessionSchema>;
+
+export const ListeningReportSchema = z.object({
+  task_id: z.string().min(1),
+  total_handshakes: z.number().int().nonnegative(),
+  accepted: z.number().int().nonnegative(),
+  rejected: z.number().int().nonnegative(),
+  timed_out: z.number().int().nonnegative(),
+  sessions: z.array(NegotiationSessionSchema),
+  generated_at: z.string().datetime()
+});
+
+export type ListeningReport = z.infer<typeof ListeningReportSchema>;
 
 export function parseTaskDocument(input: unknown): TaskDocument {
   return TaskDocumentSchema.parse(input);

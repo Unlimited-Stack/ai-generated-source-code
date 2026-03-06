@@ -14,8 +14,6 @@ describe("idempotency", () => {
       round: 1,
       payload: {
         interaction_type: "online",
-        must_match_tags: ["tagA"],
-        deal_breakers: ["tagZ"],
         target_activity: "hiking",
         target_vibe: "relaxed"
       },

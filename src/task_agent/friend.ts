@@ -9,5 +9,11 @@
 
 export async function start_chat(_taskId: string): Promise<void> {
   // TODO: implement in later phase.
+  // Will launch a chat session with the matched agent.
+}
+
+export async function send_friend_request(_taskId: string, _partnerId: string | null): Promise<void> {
+  // TODO: implement in later phase.
+  // Will send a friend/connection request to the matched agent's user.
 }
 

@@ -1,117 +1,243 @@
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
-import { processWaitingHumanTasks } from "./dispatcher";
-import { isListenerRunning, startListener, stopListener } from "./listener";
-import { startTaskLoop } from "./task_loop";
-import { cleanupExpiredData, getTaskFilePath, listAllTasks, readTaskDocument, transitionTaskStatus } from "./util/storage";
+import { getListeningReportForTask, getWaitingHumanSummary, handleWaitingHumanIntent, type WaitingHumanIntent } from "./dispatcher";
+import type { ListeningReport } from "./util/schema";
+import { startListener } from "./listener";
+import { createDraftTaskFromUserQueryIfAvailable, runTaskStepById } from "./task_loop";
+import { getTaskFilePath, listAllTasks, readTaskDocument, setTaskHidden, transitionTaskStatus } from "./util/storage";
 import type { TaskStatus } from "./util/schema";
 
 const TERMINAL_STATUSES: readonly TaskStatus[] = ["Closed", "Failed", "Timeout", "Cancelled"] as const;
 
 /**
- * Runtime：负责把“主动流 + 被动监听 + 人类可中断操作”编排成一个可交互的运行模式。
- *
- * 设计目标（对应你的需求）：
- * - 先跑一轮 `startTaskLoop()`：创建任务、推进 Drafting/Revising/Searching 等主动流程
- * - 若任务未完成：启动 listener 进入“挂起等待”模式，随时接收入站握手
- * - 挂起期间：用户可通过命令中断/修改需求（例如把某任务退回 Drafting 并编辑 task.md），再手动触发下一轮推进
- * - 若任务全部进入终态：可清理过期数据并退出进程（按需）
+ * Runtime shell:
+ * - Supports multiple tasks in storage.
+ * - Enforces one active task for user operations at a time.
+ * - Keeps listener as a global switch to accept inbound handshakes for all tasks.
  */
 export async function startTaskAgentRuntime(): Promise<void> {
-  // 先跑一轮主动流：尽可能推进任务状态。
-  await startTaskLoop();
-
-  // 非交互环境：直接开启 listener 挂起（避免因 readline 卡死）。
   if (!input.isTTY) {
     await startListener();
     return;
   }
 
   const rl = createInterface({ input, output });
+  let activeTaskId: string | null = null;
+
   try {
-    await maybeStartListenerForPendingTasks(rl);
-
+    await startListener();
+    output.write("listener service: on\n");
+    printHelp();
     while (true) {
-      // 每轮先处理 Waiting_Human（会在同一个 rl 里询问 yes/no）。
-      await processWaitingHumanTasks(rl);
-
-      // 若没有任何非终态任务，则可退出（listener 也会一并关闭）。
-      const hasActive = await hasNonTerminalTasks();
-      if (!hasActive) {
-        output.write("\n所有任务已进入终态，runtime 将退出。\n");
-        await cleanupExpiredData().catch(() => undefined);
-        break;
-      }
-
-      const line = (await rl.question("\nruntime> ")).trim();
+      const prompt = activeTaskId ? `\nruntime(${activeTaskId})> ` : "\nruntime> ";
+      const line = (await rl.question(prompt)).trim();
       if (!line) {
         continue;
       }
 
       const [command, ...args] = line.split(/\s+/);
+
       if (command === "help") {
         printHelp();
         continue;
       }
 
       if (command === "list") {
-        await printTaskStatusSummary();
+        await printTaskStatusSummary(args[0] === "all");
+        continue;
+      }
+
+      if (command === "new") {
+        const taskId = await createDraftTaskFromUserQueryIfAvailable();
+        if (taskId) {
+          activeTaskId = taskId;
+          output.write(`创建成功并设为当前任务: ${taskId}\n`);
+        }
+        continue;
+      }
+
+      if (command === "select") {
+        const taskId = args[0];
+        if (!taskId) {
+          output.write("用法：select <taskId>\n");
+          continue;
+        }
+        try {
+          await readTaskDocument(taskId);
+          activeTaskId = taskId;
+          output.write(`当前任务已切换为: ${taskId}\n`);
+        } catch (error) {
+          output.write(`select 失败：${normalizeErrorMessage(error)}\n`);
+        }
+        continue;
+      }
+
+      if (command === "active") {
+        output.write(`activeTaskId: ${activeTaskId ?? "(未选择)"}\n`);
         continue;
       }
 
       if (command === "run") {
-        await startTaskLoop();
-        await maybeStartListenerForPendingTasks(rl);
+        if (!activeTaskId) {
+          output.write("请先 select 一个 task，再执行 run。\n");
+          continue;
+        }
+        await runActiveTaskStep(activeTaskId, rl);
         continue;
       }
 
-      if (command === "listener") {
-        const sub = args[0];
-        if (sub === "on") {
-          await startListener();
-          output.write("listener: on\n");
-          continue;
-        }
-        if (sub === "off") {
-          await stopListener();
-          output.write("listener: off\n");
-          continue;
-        }
-        output.write(`listener 当前状态：${isListenerRunning() ? "on" : "off"}（用法：listener on|off）\n`);
-        continue;
-      }
-
-      if (command === "draft") {
-        const taskId = args[0];
+      if (command === "end") {
+        const taskId = args[0] ?? activeTaskId;
         if (!taskId) {
-          output.write("用法：draft <taskId>\n");
+          output.write("用法：end <taskId>（或先 select 再 end）\n");
           continue;
         }
+        await markTaskEnded(taskId);
+        if (activeTaskId === taskId) {
+          activeTaskId = null;
+        }
+        continue;
+      }
 
+      if (command === "cancel") {
+        const taskId = args[0] ?? activeTaskId;
+        if (!taskId) {
+          output.write("用法：cancel <taskId>（或先 select 再 cancel）\n");
+          continue;
+        }
+        await cancelTask(taskId);
+        if (activeTaskId === taskId) {
+          activeTaskId = null;
+        }
+        continue;
+      }
+
+      if (command === "listen") {
+        const taskId = args[0] ?? activeTaskId;
+        if (!taskId) {
+          output.write("用法：listen [taskId]（将任务挂起为 Listening 后台模式）\n");
+          continue;
+        }
         try {
-          const doc = await readTaskDocument(taskId);
-          await transitionTaskStatus(taskId, "Drafting", {
-            expectedVersion: doc.frontmatter.version,
+          const task = await readTaskDocument(taskId);
+          await transitionTaskStatus(taskId, "Listening", {
+            expectedVersion: task.frontmatter.version,
             traceId: "runtime",
             messageId: "owner"
           });
-          const filePath = await getTaskFilePath(taskId);
-          output.write(`已退回 Drafting。请编辑：${filePath}\n`);
+          output.write(`任务已挂起为 Listening：${taskId}\n`);
+          if (activeTaskId === taskId) {
+            activeTaskId = null;
+          }
         } catch (error) {
-          output.write(`draft 失败：${normalizeErrorMessage(error)}\n`);
+          output.write(`listen 失败：${normalizeErrorMessage(error)}\n`);
+        }
+        continue;
+      }
+
+      if (command === "unlisten") {
+        const taskId = args[0] ?? activeTaskId;
+        if (!taskId) {
+          output.write("用法：unlisten [taskId]（停止监听，回到 Waiting_Human）\n");
+          continue;
+        }
+        try {
+          // Generate and display listening report before transitioning
+          const report = await getListeningReportForTask(taskId);
+          printListeningReport(report);
+
+          const task = await readTaskDocument(taskId);
+          await transitionTaskStatus(taskId, "Waiting_Human", {
+            expectedVersion: task.frontmatter.version,
+            traceId: "runtime",
+            messageId: "owner"
+          });
+          activeTaskId = taskId;
+          output.write(`已停止监听，回到 Waiting_Human：${taskId}\n`);
+        } catch (error) {
+          output.write(`unlisten 失败：${normalizeErrorMessage(error)}\n`);
+        }
+        continue;
+      }
+
+      if (command === "report") {
+        const taskId = args[0] ?? activeTaskId;
+        if (!taskId) {
+          output.write("用法：report [taskId]（查看 Listening 期间的协商报告）\n");
+          continue;
+        }
+        try {
+          const report = await getListeningReportForTask(taskId);
+          printListeningReport(report);
+        } catch (error) {
+          output.write(`report 失败：${normalizeErrorMessage(error)}\n`);
+        }
+        continue;
+      }
+
+      if (command === "reopen") {
+        const taskId = args[0] ?? activeTaskId;
+        if (!taskId) {
+          output.write("用法：reopen [taskId]（重开已结束的任务 → Waiting_Human）\n");
+          continue;
+        }
+        try {
+          const task = await readTaskDocument(taskId);
+          await transitionTaskStatus(taskId, "Waiting_Human", {
+            expectedVersion: task.frontmatter.version,
+            traceId: "runtime",
+            messageId: "owner"
+          });
+          activeTaskId = taskId;
+          output.write(`任务已重开为 Waiting_Human：${taskId}\n`);
+        } catch (error) {
+          output.write(`reopen 失败：${normalizeErrorMessage(error)}\n`);
+        }
+        continue;
+      }
+
+      if (command === "hide") {
+        const taskId = args[0] ?? activeTaskId;
+        if (!taskId) {
+          output.write("用法：hide [taskId]（前端隐藏任务，后台数据保留）\n");
+          continue;
+        }
+        try {
+          await setTaskHidden(taskId, true);
+          output.write(`任务已隐藏：${taskId}\n`);
+          if (activeTaskId === taskId) {
+            activeTaskId = null;
+          }
+        } catch (error) {
+          output.write(`hide 失败：${normalizeErrorMessage(error)}\n`);
+        }
+        continue;
+      }
+
+      if (command === "unhide") {
+        const taskId = args[0];
+        if (!taskId) {
+          output.write("用法：unhide <taskId>（取消隐藏任务）\n");
+          continue;
+        }
+        try {
+          await setTaskHidden(taskId, false);
+          output.write(`任务已取消隐藏：${taskId}\n`);
+        } catch (error) {
+          output.write(`unhide 失败：${normalizeErrorMessage(error)}\n`);
         }
         continue;
       }
 
       if (command === "path") {
-        const taskId = args[0];
+        const taskId = args[0] ?? activeTaskId;
         if (!taskId) {
-          output.write("用法：path <taskId>\n");
+          output.write("用法：path <taskId>（或先 select 再 path）\n");
           continue;
         }
         try {
-          const filePath = await getTaskFilePath(taskId);
-          output.write(`${filePath}\n`);
+          const path = await getTaskFilePath(taskId);
+          output.write(`${path}\n`);
         } catch (error) {
           output.write(`path 失败：${normalizeErrorMessage(error)}\n`);
         }
@@ -127,56 +253,107 @@ export async function startTaskAgentRuntime(): Promise<void> {
     }
   } finally {
     rl.close();
-    await stopListener().catch(() => undefined);
   }
 }
 
-async function maybeStartListenerForPendingTasks(rl: ReturnType<typeof createInterface>): Promise<void> {
-  const pending = await hasPendingTasksNeedingListener();
-  if (!pending) {
-    return;
-  }
-  if (isListenerRunning()) {
-    return;
-  }
+async function runActiveTaskStep(taskId: string, rl: ReturnType<typeof createInterface>): Promise<void> {
+  try {
+    const task = await readTaskDocument(taskId);
+    if (task.frontmatter.status === "Waiting_Human") {
+      const summary = await getWaitingHumanSummary(taskId);
+      output.write(
+        [
+          "",
+          `task_id: ${summary.taskId}`,
+          `status: ${summary.status}`,
+          `target_activity: ${summary.targetActivity}`,
+          `target_vibe: ${summary.targetVibe}`
+        ].join("\n") + "\n"
+      );
 
-  const answer = (await rl.question("检测到未完成任务，是否开启 listener 挂起等待入站握手？输入 yes/no（默认 yes）："))
-    .trim()
-    .toLowerCase();
-  if (answer === "" || answer === "yes" || answer === "y") {
-    await startListener();
-    output.write("listener: on（已进入挂起等待模式；可随时输入命令中断/修改）\n");
+      const intentRaw = (await rl.question("Waiting_Human 意图：satisfied / unsatisfied / enable_listener / friend_request / closed / exit："))
+        .trim()
+        .toLowerCase();
+      if (!isWaitingHumanIntent(intentRaw)) {
+        output.write("意图无效，已跳过。\n");
+        return;
+      }
+
+      const result = await handleWaitingHumanIntent(taskId, intentRaw);
+      output.write(`${result.message}\n`);
+      return;
+    }
+
+    const result = await runTaskStepById(taskId, rl);
+    if (!result.handled) {
+      output.write(`当前状态 ${result.previousStatus} 非可运行状态。\n`);
+      return;
+    }
+    if (result.changed) {
+      output.write(`状态已推进：${result.previousStatus} -> ${result.currentStatus}\n`);
+      return;
+    }
+    output.write(`状态保持不变：${result.currentStatus}\n`);
+  } catch (error) {
+    output.write(`run 失败：${normalizeErrorMessage(error)}\n`);
   }
 }
 
-async function hasPendingTasksNeedingListener(): Promise<boolean> {
+async function markTaskEnded(taskId: string): Promise<void> {
+  try {
+    const task = await readTaskDocument(taskId);
+    if (TERMINAL_STATUSES.includes(task.frontmatter.status)) {
+      output.write(`任务已是终态：${task.frontmatter.status}\n`);
+      return;
+    }
+
+    if (task.frontmatter.status !== "Waiting_Human") {
+      output.write(`end 仅在 Waiting_Human 阶段可用（当前：${task.frontmatter.status}）。如需放弃任务请用 cancel。\n`);
+      return;
+    }
+
+    await transitionTaskStatus(taskId, "Closed", {
+      expectedVersion: task.frontmatter.version,
+      traceId: "runtime",
+      messageId: "owner"
+    });
+    output.write("任务已结束：Closed（保留数据）。\n");
+  } catch (error) {
+    output.write(`end 失败：${normalizeErrorMessage(error)}\n`);
+  }
+}
+
+async function cancelTask(taskId: string): Promise<void> {
+  try {
+    const task = await readTaskDocument(taskId);
+    if (TERMINAL_STATUSES.includes(task.frontmatter.status)) {
+      output.write(`任务已是终态：${task.frontmatter.status}\n`);
+      return;
+    }
+
+    await transitionTaskStatus(taskId, "Cancelled", {
+      expectedVersion: task.frontmatter.version,
+      traceId: "runtime",
+      messageId: "owner"
+    });
+    output.write("任务已放弃：Cancelled（保留数据）。\n");
+  } catch (error) {
+    output.write(`cancel 失败：${normalizeErrorMessage(error)}\n`);
+  }
+}
+
+async function printTaskStatusSummary(showAll = false): Promise<void> {
   const records = await listAllTasks();
-  return records.some((record) => !TERMINAL_STATUSES.includes(record.task.frontmatter.status));
-}
-
-async function hasNonTerminalTasks(): Promise<boolean> {
-  return hasPendingTasksNeedingListener();
-}
-
-async function printTaskStatusSummary(): Promise<void> {
-  const records = await listAllTasks();
-  if (records.length === 0) {
-    output.write("当前没有任务。\n");
+  const visible = showAll ? records : records.filter((r) => !r.task.frontmatter.hidden);
+  if (visible.length === 0) {
+    output.write(showAll ? "当前没有任务。\n" : "当前没有可见任务（可用 list all 查看全部）。\n");
     return;
-  }
-
-  const groups = new Map<string, string[]>();
-  for (const record of records) {
-    const status = record.task.frontmatter.status;
-    const list = groups.get(status) ?? [];
-    list.push(record.task.frontmatter.task_id);
-    groups.set(status, list);
   }
 
   output.write("\n任务状态概览：\n");
-  for (const [status, ids] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    output.write(`- ${status}: ${ids.length}\n`);
-    output.write(`  ${ids.join(", ")}\n`);
+  for (const record of visible) {
+    const hidden = record.task.frontmatter.hidden ? " [hidden]" : "";
+    output.write(`- ${record.task.frontmatter.task_id} | ${record.task.frontmatter.status} | v${record.task.frontmatter.version}${hidden}\n`);
   }
 }
 
@@ -184,15 +361,48 @@ function printHelp(): void {
   output.write(
     [
       "\n可用命令：",
-      "- help                 显示帮助",
-      "- list                 列出任务状态与 task_id",
-      "- run                  再跑一轮主动流程（startTaskLoop）",
-      "- listener on|off       开关 listener（挂起等待入站握手）",
-      "- draft <taskId>        将任务退回 Drafting，并打印 task.md 路径（用于手动修改需求）",
-      "- path <taskId>         打印某任务的 task.md 路径",
-      "- exit|quit             退出 runtime"
+      "- help                    显示帮助",
+      "- list [all]              列出可见任务（all 显示含隐藏）",
+      "- new                     创建新任务并设为 active",
+      "- select <taskId>         选择当前可操作任务",
+      "- active                  查看当前 active 任务",
+      "- run                     对 active 任务执行一步 FSM",
+      "- end [taskId]            正常结束任务（仅 Waiting_Human → Closed）",
+      "- cancel [taskId]         放弃任务（任意非终态 → Cancelled）",
+      "- listen [taskId]         挂起任务到后台监听（Waiting_Human → Listening）",
+      "- unlisten [taskId]       停止监听并查看报告（Listening → Waiting_Human）",
+      "- report [taskId]         查看 Listening 期间的协商报告",
+      "- reopen [taskId]         重开已结束任务（Closed/Cancelled → Waiting_Human）",
+      "- hide [taskId]           隐藏任务（前端不可见，数据保留）",
+      "- unhide <taskId>         取消隐藏",
+      "- path [taskId]           打印 task.md 路径",
+      "- exit|quit               退出 runtime"
     ].join("\n") + "\n"
   );
+}
+
+
+function printListeningReport(report: ListeningReport): void {
+  output.write("\n===== Listening 协商报告 =====\n");
+  output.write(`task_id: ${report.task_id}\n`);
+  output.write(`总握手数: ${report.total_handshakes}\n`);
+  output.write(`  accepted: ${report.accepted}  rejected: ${report.rejected}  timeout: ${report.timed_out}\n`);
+
+  if (report.sessions.length === 0) {
+    output.write("（Listening 期间未收到任何握手请求）\n");
+    return;
+  }
+
+  output.write("\n协商明细（按匹配度排序）：\n");
+  for (const s of report.sessions) {
+    const score = s.match_score !== null ? `${(s.match_score * 100).toFixed(0)}%` : "N/A";
+    output.write(`  [${s.status}] agent=${s.remote_agent_id}  score=${score}  rounds=${s.rounds}  l2=${s.l2_action ?? "-"}\n`);
+  }
+  output.write(`报告生成时间: ${report.generated_at}\n`);
+}
+
+function isWaitingHumanIntent(value: string): value is WaitingHumanIntent {
+  return value === "satisfied" || value === "unsatisfied" || value === "enable_listener" || value === "closed" || value === "friend_request" || value === "exit";
 }
 
 function normalizeErrorMessage(error: unknown): string {
@@ -201,4 +411,3 @@ function normalizeErrorMessage(error: unknown): string {
   }
   return "Internal error";
 }
-

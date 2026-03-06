@@ -5,14 +5,18 @@ import { retrieveBySemanticSimilarity } from "../rag/retrieval";
 import {
   appendAgentChatLog,
   appendScratchpadNote,
+  expireTimedOutSessions,
   findIdempotencyRecord,
+  findSessionByRemoteAgent,
+  generateListeningReport,
   listTasksByStatuses,
   queryL0Candidates,
   readLatestHandshakeExchange,
   readTaskDocument,
   readUserProfile,
   saveIdempotencyRecord,
-  transitionTaskStatus
+  transitionTaskStatus,
+  upsertNegotiationSession
 } from "./util/storage";
 import type {
   ErrorCode,
@@ -20,18 +24,20 @@ import type {
   HandshakeOutboundEnvelope,
   L0Candidate,
   L1Candidate,
+  ListeningReport,
+  NegotiationSession,
   TaskDocument,
   TaskStatus
 } from "./util/schema";
-import { start_chat } from "./friend";
+import { start_chat, send_friend_request } from "./friend";
 
 /**
  * 任务匹配调度器（Matching Dispatcher）。
  *
  * 职责：
- * - 主动流（active flow）：驱动本地任务的状态机推进（Drafting/Revising -> Searching -> Negotiating）
- * - 被动流（passive flow）：处理对端 agent 发来的握手协议（Handshake）入站消息，并生成出站响应
- * - 匹配漏斗：L0（结构化硬过滤）-> L1（语义检索）-> L2（本地规则/画像研判）
+ * - 主动流（active flow）：驱动本地任务的状态机推进（Drafting/Revising -> Searching(L0+L1) -> Negotiating(L2)）
+ * - 被动流（passive flow）：Listening 状态下接收对端 L2 握手，通过 session 自治处理，task 不迁移
+ * - 匹配漏斗：L0（结构化硬过滤）+ L1（语义检索）在 Searching 阶段执行；L2（双边协商）在 Negotiating/Listening 阶段执行
  *
  * I/O 边界：
  * - 本模块不直接做文件系统 I/O；所有落盘都通过 `src/task_agent/util/storage.ts`（防腐层）完成。
@@ -50,6 +56,24 @@ interface L2Decision {
   scratchpadNote: string;
 }
 
+export type WaitingHumanIntent = "satisfied" | "unsatisfied" | "enable_listener" | "closed" | "friend_request" | "exit";
+
+export interface WaitingHumanSummary {
+  taskId: string;
+  status: TaskStatus;
+  targetActivity: string;
+  targetVibe: string;
+  snapshot: Awaited<ReturnType<typeof readLatestHandshakeExchange>>;
+}
+
+export interface WaitingHumanIntentResult {
+  taskId: string;
+  intent: WaitingHumanIntent;
+  statusChanged: boolean;
+  nextStatus: TaskStatus | null;
+  message: string;
+}
+
 /**
  * 处理 Drafting/Revising 任务：推进到 Searching。
  *
@@ -57,11 +81,25 @@ interface L2Decision {
  * - Drafting：刚 intake 进来，还没进入匹配池
  * - Revising：等待 owner 修改后再尝试匹配
  */
-export async function processDraftingTasks(): Promise<void> {
+export async function processDraftingTasks(): Promise<number> {
   const draftLikeTasks = await listTasksByStatuses(["Drafting", "Revising"]);
+  let changed = 0;
   for (const task of draftLikeTasks) {
-    await transitionTaskStatus(task.frontmatter.task_id, "Searching");
+    if (await processDraftingTask(task)) {
+      changed += 1;
+    }
   }
+  return changed;
+}
+
+export async function processDraftingTask(task: TaskDocument): Promise<boolean> {
+  if (task.frontmatter.status !== "Drafting" && task.frontmatter.status !== "Revising") {
+    return false;
+  }
+  await transitionTaskStatus(task.frontmatter.task_id, "Searching", {
+    expectedVersion: task.frontmatter.version
+  });
+  return true;
 }
 
 /**
@@ -71,22 +109,37 @@ export async function processDraftingTasks(): Promise<void> {
  * - `sendInitialPropose()` 目前返回 true（占位）；未来应在此接入网络/消息总线发送 PROPOSE。
  * - 任何状态推进都应通过 `transitionTaskStatus()`，以获得乐观锁/审计日志/派生层同步语义。
  */
-export async function processSearchingTasks(): Promise<void> {
+export async function processSearchingTasks(): Promise<number> {
   const searchingTasks = await listTasksByStatuses(["Searching"]);
+  let changed = 0;
   for (const task of searchingTasks) {
-    const l1 = await runL1Retrieval(task);
-    if (l1.length === 0) {
-      continue;
+    if (await processSearchingTask(task)) {
+      changed += 1;
     }
-
-    const topCandidate = l1[0];
-    const proposeSent = await sendInitialPropose(task.frontmatter.task_id, topCandidate.taskId);
-    if (!proposeSent) {
-      continue;
-    }
-
-    await transitionTaskStatus(task.frontmatter.task_id, "Negotiating");
   }
+  return changed;
+}
+
+export async function processSearchingTask(task: TaskDocument): Promise<boolean> {
+  if (task.frontmatter.status !== "Searching") {
+    return false;
+  }
+
+  const l1 = await runL1Retrieval(task);
+  if (l1.length === 0) {
+    return false;
+  }
+
+  const topCandidate = l1[0];
+  const proposeSent = await sendInitialPropose(task.frontmatter.task_id, topCandidate.taskId);
+  if (!proposeSent) {
+    return false;
+  }
+
+  await transitionTaskStatus(task.frontmatter.task_id, "Negotiating", {
+    expectedVersion: task.frontmatter.version
+  });
+  return true;
 }
 
 /**
@@ -154,6 +207,159 @@ export async function processWaitingHumanTasks(rl?: Interface): Promise<void> {
   }
 }
 
+export async function processWaitingHumanTask(task: TaskDocument, rl?: Interface): Promise<boolean> {
+  if (task.frontmatter.status !== "Waiting_Human") {
+    return false;
+  }
+  if (!rl && !input.isTTY) {
+    return false;
+  }
+
+  const localRl = rl ?? createInterface({ input, output });
+  const shouldClose = rl === undefined;
+  try {
+    const summary = await getWaitingHumanSummary(task.frontmatter.task_id);
+    const summaryText = formatHandshakeSummary(task, summary.snapshot);
+
+    output.write(`\n===== Waiting_Human: 需要你确认握手结果 =====\n`);
+    output.write(`${summaryText}\n`);
+
+    const answer = (await localRl.question("是否满意本次握手结果？输入 yes 进入聊天；输入 no 退回 Drafting："))
+      .trim()
+      .toLowerCase();
+    if (answer === "yes" || answer === "y") {
+      const result = await handleWaitingHumanIntent(task.frontmatter.task_id, "satisfied");
+      return result.statusChanged || result.intent === "satisfied";
+    }
+
+    if (answer === "no" || answer === "n") {
+      try {
+        const result = await handleWaitingHumanIntent(task.frontmatter.task_id, "unsatisfied");
+        return result.statusChanged;
+      } catch (error) {
+        output.write(`状态回退失败（可能是并发更新导致版本冲突）：${normalizeErrorMessage(error)}\n`);
+        return false;
+      }
+    }
+
+    output.write("输入无效，跳过该任务（保持 Waiting_Human）。\n");
+    return false;
+  } finally {
+    if (shouldClose) {
+      localRl.close();
+    }
+  }
+}
+
+export async function getWaitingHumanSummary(taskId: string): Promise<WaitingHumanSummary> {
+  const task = await readTaskDocument(taskId);
+  const snapshot = await readLatestHandshakeExchange(taskId);
+  return {
+    taskId,
+    status: task.frontmatter.status,
+    targetActivity: task.body.targetActivity,
+    targetVibe: task.body.targetVibe,
+    snapshot
+  };
+}
+
+/**
+ * Generate a listening report for a task (expire timed-out sessions first).
+ * Used when user does `unlisten` to see what happened during Listening.
+ */
+export async function getListeningReportForTask(taskId: string): Promise<ListeningReport> {
+  await expireTimedOutSessions(taskId);
+  return generateListeningReport(taskId);
+}
+
+export async function handleWaitingHumanIntent(taskId: string, intent: WaitingHumanIntent): Promise<WaitingHumanIntentResult> {
+  const task = await readTaskDocument(taskId);
+  if (task.frontmatter.status !== "Waiting_Human") {
+    return {
+      taskId,
+      intent,
+      statusChanged: false,
+      nextStatus: task.frontmatter.status,
+      message: `Task is not Waiting_Human: ${task.frontmatter.status}`
+    };
+  }
+
+  if (intent === "satisfied") {
+    await start_chat(taskId);
+    return {
+      taskId,
+      intent,
+      statusChanged: false,
+      nextStatus: task.frontmatter.status,
+      message: "Accepted by human; start_chat invoked."
+    };
+  }
+
+  if (intent === "unsatisfied") {
+    await transitionTaskStatus(taskId, "Drafting", {
+      expectedVersion: task.frontmatter.version,
+      traceId: "waiting_human",
+      messageId: "owner"
+    });
+    return {
+      taskId,
+      intent,
+      statusChanged: true,
+      nextStatus: "Drafting",
+      message: "Moved back to Drafting for revision."
+    };
+  }
+
+  if (intent === "closed") {
+    await transitionTaskStatus(taskId, "Closed", {
+      expectedVersion: task.frontmatter.version,
+      traceId: "waiting_human",
+      messageId: "owner"
+    });
+    return {
+      taskId,
+      intent,
+      statusChanged: true,
+      nextStatus: "Closed",
+      message: "Task closed by human."
+    };
+  }
+
+  if (intent === "enable_listener") {
+    await transitionTaskStatus(taskId, "Listening", {
+      expectedVersion: task.frontmatter.version,
+      traceId: "waiting_human",
+      messageId: "owner"
+    });
+    return {
+      taskId,
+      intent,
+      statusChanged: true,
+      nextStatus: "Listening",
+      message: "Task moved to Listening (background)."
+    };
+  }
+
+  if (intent === "friend_request") {
+    await send_friend_request(taskId, task.frontmatter.current_partner_id);
+    return {
+      taskId,
+      intent,
+      statusChanged: false,
+      nextStatus: task.frontmatter.status,
+      message: "Friend request sent (placeholder)."
+    };
+  }
+
+  return {
+    taskId,
+    intent,
+    statusChanged: false,
+    nextStatus: task.frontmatter.status,
+    message: "Exit requested by user."
+  };
+}
+
 /**
  * 处理入站握手协议消息（被动流）。
  *
@@ -170,6 +376,11 @@ export async function processWaitingHumanTasks(rl?: Interface): Promise<void> {
  * 被使用位置：
  * - 当前代码库暂无直接引用（通常由网络层/协议层在收到对端消息时调用）
  */
+/** Timeout for session-level L2 initial evaluation (10 seconds). */
+const SESSION_INITIAL_TIMEOUT_MS = 10_000;
+/** Timeout for session-level L2 multi-round negotiation (30 seconds). */
+const SESSION_NEGOTIATING_TIMEOUT_MS = 30_000;
+
 export async function dispatchInboundHandshake(envelope: HandshakeInboundEnvelope): Promise<HandshakeOutboundEnvelope> {
   const now = new Date().toISOString();
 
@@ -193,37 +404,19 @@ export async function dispatchInboundHandshake(envelope: HandshakeInboundEnvelop
   try {
     const localTask = await readTaskDocument(envelope.task_id);
 
-    // round 超限：若本地仍在 Searching/Negotiating，视为超时并拒绝。
-    if (envelope.round >= 5 && isStatusOneOf(localTask.frontmatter.status, ["Searching", "Negotiating"])) {
-      await transitionTaskStatus(envelope.task_id, "Timeout", { expectedVersion: localTask.frontmatter.version });
-      response = buildActionResponse(envelope, "REJECT");
-    } else if (envelope.action === "CANCEL") {
-      // 对端要求取消：只有在本地处于可取消状态时才真正迁移到 Cancelled。
-      if (isStatusOneOf(localTask.frontmatter.status, ["Drafting", "Searching", "Negotiating", "Waiting_Human", "Revising"])) {
-        await transitionTaskStatus(envelope.task_id, "Cancelled", { expectedVersion: localTask.frontmatter.version });
-      }
+    // Listening tasks: autonomous session-based processing (task stays in Listening)
+    if (localTask.frontmatter.status === "Listening") {
+      response = await handleListeningHandshake(localTask, envelope, now);
+    }
+    // Negotiating tasks: allow replies from current_partner_id only
+    else if (localTask.frontmatter.status === "Negotiating") {
+      response = await handleNegotiatingHandshake(localTask, envelope, now);
+    }
+    // All other statuses: reject
+    else {
       response = buildActionResponse(envelope, "CANCEL");
-    } else {
-      // 其余动作走 L2 研判（本地规则/画像/冲突判断）。
-      const decision = await executeL2Sandbox(localTask, envelope);
-      await appendScratchpadNote(envelope.task_id, decision.scratchpadNote, now);
-
-      if (decision.shouldMoveToRevising && localTask.frontmatter.status === "Waiting_Human") {
-        await transitionTaskStatus(envelope.task_id, "Revising", { expectedVersion: localTask.frontmatter.version });
-      }
-
-      if (decision.action === "ACCEPT" && envelope.action === "ACCEPT") {
-        const latestTask = await readTaskDocument(envelope.task_id);
-        if (isStatusOneOf(latestTask.frontmatter.status, ["Searching", "Negotiating"])) {
-          await transitionTaskStatus(envelope.task_id, "Waiting_Human", { expectedVersion: latestTask.frontmatter.version });
-        }
-        await notifyOwnerForHumanReview(envelope.task_id);
-      }
-
-      response = buildActionResponse(envelope, decision.action);
     }
   } catch (error) {
-    // 将内部异常归一化为协议错误响应，避免抛到上游导致消息丢失。
     response = buildErrorResponse(envelope, classifyErrorCode(error), normalizeErrorMessage(error));
   }
 
@@ -243,9 +436,148 @@ export async function dispatchInboundHandshake(envelope: HandshakeInboundEnvelop
 }
 
 /**
+ * Handle inbound L2 handshake for a Listening task.
+ * L0/L1 are already done by the sender (active flow). Listening only evaluates L2 (bilateral negotiation).
+ * Task stays in Listening. Results accumulate in sessions for later report.
+ */
+async function handleListeningHandshake(
+  localTask: TaskDocument,
+  envelope: HandshakeInboundEnvelope,
+  now: string
+): Promise<HandshakeOutboundEnvelope> {
+  if (envelope.action === "CANCEL") {
+    // Mark existing session as rejected if one exists
+    const existing = await findSessionByRemoteAgent(envelope.task_id, envelope.sender_agent_id);
+    if (existing) {
+      existing.status = "Rejected";
+      existing.updated_at = now;
+      await upsertNegotiationSession(existing);
+    }
+    return buildActionResponse(envelope, "CANCEL");
+  }
+
+  // Find or create a session for this remote agent
+  let session = await findSessionByRemoteAgent(envelope.task_id, envelope.sender_agent_id);
+  if (!session) {
+    session = createNewSession(envelope, now, SESSION_INITIAL_TIMEOUT_MS);
+  }
+
+  // Check session timeout
+  if (Date.now() > Date.parse(session.timeout_at)) {
+    session.status = "Timeout";
+    session.updated_at = now;
+    await upsertNegotiationSession(session);
+    return buildActionResponse(envelope, "REJECT");
+  }
+
+  // Round limit: reject if too many rounds
+  if (envelope.round >= 5) {
+    session.status = "Timeout";
+    session.updated_at = now;
+    session.rounds = envelope.round;
+    await upsertNegotiationSession(session);
+    return buildActionResponse(envelope, "REJECT");
+  }
+
+  // L2 bilateral evaluation: sender already passed us through their L0+L1, now we evaluate from our side
+  const decision = await executeL2Sandbox(localTask, envelope);
+  await appendScratchpadNote(envelope.task_id, decision.scratchpadNote, now);
+
+  session.rounds = envelope.round + 1;
+  session.updated_at = now;
+  session.l2_action = decision.action;
+
+  if (decision.action === "ACCEPT" && envelope.action === "ACCEPT") {
+    // Bilateral accept: session complete
+    session.status = "Accepted";
+    session.match_score = computeMatchScore(localTask, envelope);
+  } else if (decision.action === "REJECT") {
+    session.status = "Rejected";
+  } else {
+    // Ongoing negotiation (PROPOSE/COUNTER_PROPOSE exchange)
+    session.status = "Negotiating";
+    session.timeout_at = new Date(Date.now() + SESSION_NEGOTIATING_TIMEOUT_MS).toISOString();
+    session.match_score = computeMatchScore(localTask, envelope);
+  }
+
+  await upsertNegotiationSession(session);
+  return buildActionResponse(envelope, decision.action);
+}
+
+/**
+ * Handle handshake for a Negotiating task (active flow):
+ * Only accept messages from current_partner_id.
+ */
+async function handleNegotiatingHandshake(
+  localTask: TaskDocument,
+  envelope: HandshakeInboundEnvelope,
+  now: string
+): Promise<HandshakeOutboundEnvelope> {
+  // If task has a partner locked in, only accept from that partner
+  if (localTask.frontmatter.current_partner_id && localTask.frontmatter.current_partner_id !== envelope.sender_agent_id) {
+    return buildActionResponse(envelope, "REJECT");
+  }
+
+  if (envelope.action === "CANCEL") {
+    await transitionTaskStatus(envelope.task_id, "Cancelled", { expectedVersion: localTask.frontmatter.version });
+    return buildActionResponse(envelope, "CANCEL");
+  }
+
+  if (envelope.round >= 5) {
+    await transitionTaskStatus(envelope.task_id, "Timeout", { expectedVersion: localTask.frontmatter.version });
+    return buildActionResponse(envelope, "REJECT");
+  }
+
+  const decision = await executeL2Sandbox(localTask, envelope);
+  await appendScratchpadNote(envelope.task_id, decision.scratchpadNote, now);
+
+  if (decision.action === "ACCEPT" && envelope.action === "ACCEPT") {
+    await transitionTaskStatus(envelope.task_id, "Waiting_Human", { expectedVersion: localTask.frontmatter.version });
+    await notifyOwnerForHumanReview(envelope.task_id);
+  }
+
+  return buildActionResponse(envelope, decision.action);
+}
+
+function createNewSession(envelope: HandshakeInboundEnvelope, now: string, timeoutMs: number): NegotiationSession {
+  return {
+    session_id: randomUUID(),
+    task_id: envelope.task_id,
+    remote_agent_id: envelope.sender_agent_id,
+    remote_task_id: envelope.task_id,
+    status: "Negotiating",
+    match_score: null,
+    l2_action: null,
+    rounds: 0,
+    started_at: now,
+    updated_at: now,
+    timeout_at: new Date(Date.now() + timeoutMs).toISOString()
+  };
+}
+
+/**
+ * Compute a rough match score based on tag overlap and payload compatibility.
+ * Returns 0.0-1.0. Used for report ranking.
+ */
+function computeMatchScore(localTask: TaskDocument, envelope: HandshakeInboundEnvelope): number {
+  const interactionMatch =
+    localTask.frontmatter.interaction_type === "any" ||
+    envelope.payload.interaction_type === "any" ||
+    localTask.frontmatter.interaction_type === envelope.payload.interaction_type
+      ? 1.0
+      : 0.0;
+
+  const hasActivity = envelope.payload.target_activity.length > 0 ? 0.5 : 0;
+  const hasVibe = envelope.payload.target_vibe.length > 0 ? 0.5 : 0;
+  const contentScore = hasActivity + hasVibe;
+
+  return Math.round((interactionMatch * 0.4 + contentScore * 0.6) * 100) / 100;
+}
+
+/**
  * L0：结构化硬过滤（只返回候选 taskId 列表 + 通过原因）。
  *
- * 过滤规则由 `queryL0Candidates()` 实现（tags / deal_breakers / interaction_type）。
+ * 过滤规则由 `queryL0Candidates()` 实现（interaction_type 兼容性）。
  */
 export async function runL0Filter(task: TaskDocument): Promise<L0Candidate[]> {
   const candidateIds = await queryL0Candidates(task.frontmatter.task_id);
@@ -311,15 +643,6 @@ export async function executeL2Sandbox(task: TaskDocument, envelope: HandshakeIn
     envelope.payload.interaction_type === "any" ||
     task.frontmatter.interaction_type === envelope.payload.interaction_type;
 
-  const localTagSet = new Set(task.frontmatter.must_match_tags);
-  const inboundTagSet = new Set(envelope.payload.must_match_tags);
-  const localBreakSet = new Set(task.frontmatter.deal_breakers);
-  const inboundBreakSet = new Set(envelope.payload.deal_breakers);
-
-  const localBreaksInbound = [...localBreakSet].some((breaker) => inboundTagSet.has(breaker));
-  const inboundBreaksLocal = [...inboundBreakSet].some((breaker) => localTagSet.has(breaker));
-  const hasConflict = localBreaksInbound || inboundBreaksLocal || !interactionCompatible;
-
   if (envelope.action === "REJECT") {
     return {
       action: "REJECT",
@@ -336,11 +659,11 @@ export async function executeL2Sandbox(task: TaskDocument, envelope: HandshakeIn
     };
   }
 
-  if (hasConflict) {
+  if (!interactionCompatible) {
     return {
       action: "REJECT",
       shouldMoveToRevising: false,
-      scratchpadNote: "L2 conflict on interaction/deal-breakers. Reject."
+      scratchpadNote: "L2 conflict on interaction_type. Reject."
     };
   }
 
@@ -385,8 +708,6 @@ async function sendInitialPropose(sourceTaskId: string, targetTaskId: string): P
     round: 0,
     payload: {
       interaction_type: sourceTask.frontmatter.interaction_type,
-      must_match_tags: sourceTask.frontmatter.must_match_tags,
-      deal_breakers: sourceTask.frontmatter.deal_breakers,
       target_activity: sourceTask.body.targetActivity,
       target_vibe: sourceTask.body.targetVibe
     },
@@ -521,8 +842,6 @@ function formatHandshakeSummary(
     lines.push(`from: ${snapshot.inbound.sender_agent_id} -> ${snapshot.inbound.receiver_agent_id}`);
     lines.push(`action: ${snapshot.inbound.action}  round: ${snapshot.inbound.round}`);
     lines.push(`interaction_type: ${snapshot.inbound.payload.interaction_type}`);
-    lines.push(`must_match_tags: ${snapshot.inbound.payload.must_match_tags.join(", ") || "(空)"}`);
-    lines.push(`deal_breakers: ${snapshot.inbound.payload.deal_breakers.join(", ") || "(空)"}`);
     lines.push(`target_activity: ${snapshot.inbound.payload.target_activity}`);
     lines.push(`target_vibe: ${snapshot.inbound.payload.target_vibe}`);
     lines.push(`timestamp: ${snapshot.inbound.timestamp}`);

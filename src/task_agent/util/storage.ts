@@ -4,16 +4,20 @@ import type {
   ErrorCode,
   HandshakeInboundEnvelope,
   HandshakeOutboundEnvelope,
+  ListeningReport,
+  NegotiationSession,
+  SessionStatus,
   TaskDocument,
   TaskFrontmatter,
   TaskStatus
 } from "./schema";
-import { parseHandshakeInboundEnvelope, parseHandshakeOutboundEnvelope, parseTaskDocument } from "./schema";
+import { NegotiationSessionSchema, parseHandshakeInboundEnvelope, parseHandshakeOutboundEnvelope, parseTaskDocument } from "./schema";
+import { upsertTaskSnapshot } from "./sqlite";
 
 /**
  * 存储/持久化防腐层（Anti-Corruption Layer）。
  *
- * 本模块是任务系统所有“落盘写入”的唯一入口之一（另一个可能是后续的 SQLite/RAG 派生层实现）。
+ * 本模块是任务系统所有"落盘写入"的唯一入口之一（另一个可能是后续的 SQLite/RAG 派生层实现）。
  * 目标：把文件系统细节与上层业务逻辑隔离，避免其他模块随意写 `.data/` 导致耦合与数据污染。
  *
  * 设计约定（相对 `process.cwd()`）：
@@ -27,8 +31,8 @@ import { parseHandshakeInboundEnvelope, parseHandshakeOutboundEnvelope, parseTas
  * - `.data/logs/`：系统/审计日志（JSONL）
  *
  * 注意：
- * - 本模块大量使用“安全读取”（文件不存在则返回空），因为这些文件多为可重建的派生数据。
- * - 状态迁移采用“两阶段写”：先写 `task.md` 并置 `pending_sync=true`，再同步派生层并清标记。
+ * - 本模块大量使用"安全读取"（文件不存在则返回空），因为这些文件多为可重建的派生数据。
+ * - 状态迁移采用"两阶段写"：先写 `task.md` 并置 `pending_sync=true`，再同步派生层并清标记。
  */
 
 /**
@@ -60,6 +64,7 @@ export interface TransitionResult {
   version: number;
   updatedAt: string;
 }
+
 
 /**
  * 状态迁移的可选元信息。
@@ -156,13 +161,13 @@ const ALLOWED_STATUS_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatu
   Drafting: ["Searching", "Cancelled"],
   Searching: ["Negotiating", "Timeout", "Failed", "Cancelled"],
   Negotiating: ["Waiting_Human", "Timeout", "Failed", "Cancelled"],
-  // 允许回到 Drafting：用于 owner 在 Waiting_Human 阶段不满意本次握手结果时“回炉重做”。
-  Waiting_Human: ["Revising", "Drafting", "Closed", "Cancelled"],
+  Waiting_Human: ["Revising", "Drafting", "Listening", "Closed", "Cancelled"],
+  Listening: ["Waiting_Human", "Cancelled"],
   Revising: ["Searching", "Cancelled"],
-  Closed: [],
+  Closed: ["Waiting_Human"],
   Failed: ["Searching"],
   Timeout: ["Searching"],
-  Cancelled: []
+  Cancelled: ["Waiting_Human"]
 };
 
 /**
@@ -198,6 +203,11 @@ export async function saveTaskMD(task: TaskDocument, options: SaveTaskOptions = 
 
   const serialized = serializeTaskMDContent(validated);
   await writeFile(taskPath, serialized, "utf8");
+  try {
+    await syncDerivedLayers(validated);
+  } catch {
+    // Creating task.md should not fail because of derived-layer lock/availability issues.
+  }
 }
 
 /**
@@ -210,23 +220,42 @@ export async function updateTaskStatus(taskId: string, nextStatus: TaskStatus): 
   await transitionTaskStatus(taskId, nextStatus);
 }
 
+export async function setTaskHidden(taskId: string, hidden: boolean): Promise<void> {
+  const taskPath = await resolveTaskPathByTaskId(taskId);
+  const current = await readTaskDocumentByPath(taskPath);
+
+  if (current.frontmatter.hidden === hidden) {
+    return;
+  }
+
+  const updated = parseTaskDocument({
+    frontmatter: {
+      ...current.frontmatter,
+      hidden,
+      updated_at: new Date().toISOString(),
+      version: current.frontmatter.version + 1
+    },
+    body: current.body
+  });
+
+  await writeFile(taskPath, serializeTaskMDContent(updated), "utf8");
+  try {
+    await syncDerivedLayers(updated);
+  } catch {
+    // Non-critical: derived layer sync failure does not block hide/unhide.
+  }
+}
+
 /**
- * L0 结构化“硬过滤”候选查询（只基于结构化字段，不做语义计算）。
- *
- * 应用场景：
- * - `src/task_agent/dispatcher.ts`：语义检索（L1）前的候选裁剪，避免明显不合规的任务进入 L1/L2。
+ * L0 结构化"硬过滤"候选查询（只基于结构化字段，不做语义计算）。
  *
  * 过滤规则：
  * - 只考虑 `status=Searching` 的任务
  * - `interaction_type` 必须兼容（任意/一致）
- * - `must_match_tags` 必须双向满足（彼此都包含对方的 must tags）
- * - `deal_breakers` 不能与对方 tags 冲突
  */
 export async function queryL0Candidates(_taskId: string): Promise<string[]> {
   const source = await readTaskDocument(_taskId);
   const records = await listAllTaskRecords();
-  const sourceTags = new Set(source.frontmatter.must_match_tags);
-  const sourceDealBreakers = new Set(source.frontmatter.deal_breakers);
   const sourceInteraction = source.frontmatter.interaction_type;
 
   const result: string[] = [];
@@ -239,25 +268,10 @@ export async function queryL0Candidates(_taskId: string): Promise<string[]> {
       continue;
     }
 
-    const candidateTags = new Set(candidate.frontmatter.must_match_tags);
-    const candidateDealBreakers = new Set(candidate.frontmatter.deal_breakers);
     const candidateInteraction = candidate.frontmatter.interaction_type;
-
     const interactionCompatible =
       sourceInteraction === "any" || candidateInteraction === "any" || sourceInteraction === candidateInteraction;
     if (!interactionCompatible) {
-      continue;
-    }
-
-    const sourceTagsSatisfied = [...sourceTags].every((tag) => candidateTags.has(tag));
-    const candidateTagsSatisfied = [...candidateTags].every((tag) => sourceTags.has(tag));
-    if (!sourceTagsSatisfied || !candidateTagsSatisfied) {
-      continue;
-    }
-
-    const sourceBreaksCandidate = [...sourceDealBreakers].some((breaker) => candidateTags.has(breaker));
-    const candidateBreaksSource = [...candidateDealBreakers].some((breaker) => sourceTags.has(breaker));
-    if (sourceBreaksCandidate || candidateBreaksSource) {
       continue;
     }
 
@@ -319,7 +333,7 @@ export async function getTaskFilePath(taskId: string): Promise<string> {
 }
 
 /**
- * 任务状态迁移（乐观锁 + 审计 + “先真相源后派生层”两阶段写入）。
+ * 任务状态迁移（乐观锁 + 审计 + "先真相源后派生层"两阶段写入）。
  *
  * 核心语义：
  * - Step 1：先写入 `task.md`（真相源）并置 `pending_sync=true`
@@ -370,7 +384,7 @@ export async function transitionTaskStatus(
     // Step 2：同步派生层（SQLite / RAG 等），本阶段为占位实现。
     await syncDerivedLayers(step1Doc);
 
-    // Step 3：派生层同步成功后清理 `pending_sync`（表示“已完全一致”）。
+    // Step 3：派生层同步成功后清理 `pending_sync`（表示"已完全一致"）。
     const step3Doc = parseTaskDocument({
       frontmatter: {
         ...step1Doc.frontmatter,
@@ -461,7 +475,7 @@ export async function retrySyncRepairs(): Promise<SyncRepairJob[]> {
  * 行为：
  * - 计算入站 envelope 的幂等键
  * - 读取 JSONL 记录并按窗口裁剪（默认 7 天）
- * - 若命中同一 key，则直接返回之前落盘的 response（实现“至多一次”效果）
+ * - 若命中同一 key，则直接返回之前落盘的 response（实现"至多一次"效果）
  *
  * 被使用位置：
  * - `src/task_agent/dispatcher.ts`：`dispatchInboundHandshake()` 首先尝试重放
@@ -534,14 +548,14 @@ export async function appendAgentChatLog(taskId: string, entry: AgentChatLogEntr
 }
 
 /**
- * 读取最近一次握手收发快照（用于 Waiting_Human 阶段向用户展示“本次握手发生了什么”）。
+ * 读取最近一次握手收发快照（用于 Waiting_Human 阶段向用户展示"本次握手发生了什么"）。
  *
  * 读取来源：
  * - `task_dir/data/agent_chat/YYYY-MM-DD-agentchat.jsonl`（由 `appendAgentChatLog()` 写入）
  *
  * 注意：
- * - 这是“尽力而为”的读取：若文件缺失/解析失败，则返回 null 字段，不抛错。
- * - 当前只读取“最后一个” agentchat 文件，并从末尾向前寻找最近的 inbound/outbound 报文。
+ * - 这是"尽力而为"的读取：若文件缺失/解析失败，则返回 null 字段，不抛错。
+ * - 当前只读取"最后一个" agentchat 文件，并从末尾向前寻找最近的 inbound/outbound 报文。
  */
 export async function readLatestHandshakeExchange(taskId: string): Promise<HandshakeExchangeSnapshot> {
   const taskPath = await resolveTaskPathByTaskId(taskId);
@@ -695,7 +709,7 @@ export async function appendObservabilityLog(event: ObservabilityLogEvent): Prom
  * 清理后会写一条审计日志到 `.data/logs/`。
  *
  * 注意：
- * - 这里通过文件名中的日期前缀判断“文件年龄”，不依赖文件系统 mtime（更稳定/可搬迁）。
+ * - 这里通过文件名中的日期前缀判断"文件年龄"，不依赖文件系统 mtime（更稳定/可搬迁）。
  */
 export async function cleanupExpiredData(nowIso = new Date().toISOString()): Promise<RetentionCleanupResult> {
   const nowMs = Date.parse(nowIso);
@@ -831,7 +845,7 @@ function assertTransitionAllowed(current: TaskStatus, next: TaskStatus): void {
  * - `createIfMissing=true`：用于首次创建任务时生成一个目录并返回其 `task.md` 路径。
  *
  * 性能说明：
- * - 当前实现是“全量扫描”，适合任务量不大/本地原型阶段；
+ * - 当前实现是"全量扫描"，适合任务量不大/本地原型阶段；
  * - 若任务量增大，建议引入索引或稳定映射（例如 task_id -> folder 的 KV）。
  */
 async function resolveTaskPathByTaskId(taskId: string, createIfMissing = false): Promise<string> {
@@ -898,14 +912,17 @@ export function parseTaskMDContent(content: string): TaskDocument {
  */
 export function serializeTaskMDContent(task: TaskDocument): string {
   const frontmatterYaml = serializeSimpleYamlObject(task.frontmatter);
-  return `---\n${frontmatterYaml}\n---\n\n### 原始描述\n${task.body.rawDescription}\n\n### 靶向映射\n<Target_Activity>${task.body.targetActivity}</Target_Activity>\n<Target_Vibe>${task.body.targetVibe}</Target_Vibe>\n`;
+  const detailedSection = task.body.detailedPlan
+    ? `\n\n### 需求详情\n${task.body.detailedPlan}`
+    : "\n\n### 需求详情\n（待 AI 生成）";
+  return `---\n${frontmatterYaml}\n---\n\n### 原始描述\n${task.body.rawDescription}\n\n### 靶向映射\n<Target_Activity>${task.body.targetActivity}</Target_Activity>\n<Target_Vibe>${task.body.targetVibe}</Target_Vibe>${detailedSection}\n`;
 }
 
 /**
  * 解析任务正文的固定模板段落。
  * 缺失字段则抛错，防止脏数据扩散到后续状态机/检索管线。
  */
-function parseTaskBody(bodyText: string): { rawDescription: string; targetActivity: string; targetVibe: string } {
+function parseTaskBody(bodyText: string): { rawDescription: string; targetActivity: string; targetVibe: string; detailedPlan: string } {
   const rawSection = bodyText.match(/### 原始描述\s*([\s\S]*?)\n### 靶向映射/);
   const activityMatch = bodyText.match(/<Target_Activity>([\s\S]*?)<\/Target_Activity>/);
   const vibeMatch = bodyText.match(/<Target_Vibe>([\s\S]*?)<\/Target_Vibe>/);
@@ -918,7 +935,13 @@ function parseTaskBody(bodyText: string): { rawDescription: string; targetActivi
   const targetActivity = activityMatch[1].trim();
   const targetVibe = vibeMatch[1].trim();
 
-  return { rawDescription, targetActivity, targetVibe };
+  // Parse optional detailed plan section
+  const detailedMatch = bodyText.match(/### 需求详情\s*([\s\S]*)$/);
+  const detailedPlan = detailedMatch ? detailedMatch[1].trim() : "";
+  // Filter out placeholder text
+  const cleanPlan = detailedPlan === "（待 AI 生成）" ? "" : detailedPlan;
+
+  return { rawDescription, targetActivity, targetVibe, detailedPlan: cleanPlan };
 }
 
 /**
@@ -982,21 +1005,14 @@ function serializeSimpleYamlObject(frontmatter: TaskFrontmatter): string {
     `task_id: ${quoteYaml(frontmatter.task_id)}`,
     `status: ${quoteYaml(frontmatter.status)}`,
     `interaction_type: ${quoteYaml(frontmatter.interaction_type)}`,
-    `must_match_tags: ${serializeStringArray(frontmatter.must_match_tags)}`,
-    `deal_breakers: ${serializeStringArray(frontmatter.deal_breakers)}`,
     `current_partner_id: ${frontmatter.current_partner_id === null ? "null" : quoteYaml(frontmatter.current_partner_id)}`,
     `entered_status_at: ${quoteYaml(frontmatter.entered_status_at)}`,
     `created_at: ${quoteYaml(frontmatter.created_at)}`,
     `updated_at: ${quoteYaml(frontmatter.updated_at)}`,
     `version: ${frontmatter.version}`,
-    `pending_sync: ${frontmatter.pending_sync ? "true" : "false"}`
+    `pending_sync: ${frontmatter.pending_sync ? "true" : "false"}`,
+    `hidden: ${frontmatter.hidden ? "true" : "false"}`
   ].join("\n");
-}
-
-/** 把 string[] 序列化为 YAML 内联数组。 */
-function serializeStringArray(values: string[]): string {
-  const serialized = values.map((value) => quoteYaml(value)).join(", ");
-  return `[${serialized}]`;
 }
 
 /** YAML 字符串转义与引用（仅处理双引号转义）。 */
@@ -1084,7 +1100,7 @@ async function safeReadText(filePath: string): Promise<string> {
   try {
     return await readFile(filePath, "utf8");
   } catch {
-    // 刻意吞掉错误：这些文件多为“派生/可选数据”，缺失不应中断主流程。
+    // 刻意吞掉错误：这些文件多为"派生/可选数据"，缺失不应中断主流程。
     return "";
   }
 }
@@ -1215,5 +1231,125 @@ function normalizeErrorReason(error: unknown): string {
 }
 
 async function syncDerivedLayers(_task: TaskDocument): Promise<void> {
-  // 预留：同步 SQLite/RAG 等派生层。失败不回滚 task.md，只入修复队列。
+  const taskPath = await resolveTaskPathByTaskId(_task.frontmatter.task_id);
+  upsertTaskSnapshot(_task, taskPath);
+}
+
+// ---------------------------------------------------------------------------
+// Negotiation Session Storage
+// ---------------------------------------------------------------------------
+
+/**
+ * Create or update a negotiation session for a Listening task.
+ * Sessions are stored in `task_dir/data/sessions.jsonl`.
+ */
+export async function upsertNegotiationSession(session: NegotiationSession): Promise<void> {
+  const sessions = await readAllSessions(session.task_id);
+  const index = sessions.findIndex((s) => s.session_id === session.session_id);
+  if (index >= 0) {
+    sessions[index] = session;
+  } else {
+    sessions.push(session);
+  }
+  await rewriteSessions(session.task_id, sessions);
+}
+
+/**
+ * Find an existing session by remote_agent_id (for multi-round negotiation with the same agent).
+ */
+export async function findSessionByRemoteAgent(taskId: string, remoteAgentId: string): Promise<NegotiationSession | null> {
+  const sessions = await readAllSessions(taskId);
+  return sessions.find((s) => s.remote_agent_id === remoteAgentId && s.status !== "Rejected" && s.status !== "Timeout") ?? null;
+}
+
+/**
+ * List all negotiation sessions for a task.
+ */
+export async function listNegotiationSessions(taskId: string): Promise<NegotiationSession[]> {
+  return readAllSessions(taskId);
+}
+
+/**
+ * Generate a ListeningReport from all sessions accumulated during Listening.
+ */
+export async function generateListeningReport(taskId: string): Promise<ListeningReport> {
+  const sessions = await readAllSessions(taskId);
+  const accepted = sessions.filter((s) => s.status === "Accepted").length;
+  const rejected = sessions.filter((s) => s.status === "Rejected").length;
+  const timedOut = sessions.filter((s) => s.status === "Timeout").length;
+
+  // Sort by match_score descending (accepted first, then by score)
+  const sorted = [...sessions].sort((a, b) => {
+    const statusOrder: Record<SessionStatus, number> = { Accepted: 0, Negotiating: 1, Rejected: 2, Timeout: 3 };
+    const aDiff = statusOrder[a.status] - statusOrder[b.status];
+    if (aDiff !== 0) return aDiff;
+    return (b.match_score ?? -1) - (a.match_score ?? -1);
+  });
+
+  return {
+    task_id: taskId,
+    total_handshakes: sessions.length,
+    accepted,
+    rejected,
+    timed_out: timedOut,
+    sessions: sorted,
+    generated_at: new Date().toISOString()
+  };
+}
+
+/**
+ * Mark timed-out sessions. Returns the number of sessions that were timed out.
+ */
+export async function expireTimedOutSessions(taskId: string): Promise<number> {
+  const sessions = await readAllSessions(taskId);
+  const now = Date.now();
+  let expired = 0;
+  for (const session of sessions) {
+    if (session.status === "Negotiating") {
+      if (now > Date.parse(session.timeout_at)) {
+        session.status = "Timeout";
+        session.updated_at = new Date().toISOString();
+        expired += 1;
+      }
+    }
+  }
+  if (expired > 0) {
+    await rewriteSessions(taskId, sessions);
+  }
+  return expired;
+}
+
+async function readAllSessions(taskId: string): Promise<NegotiationSession[]> {
+  const taskPath = await resolveTaskPathByTaskId(taskId);
+  const taskDir = path.dirname(taskPath);
+  const sessionsFile = path.join(taskDir, "data", "sessions.jsonl");
+  const raw = await safeReadText(sessionsFile);
+  if (raw.trim().length === 0) {
+    return [];
+  }
+  const lines = raw.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  const result: NegotiationSession[] = [];
+  for (const line of lines) {
+    try {
+      const parsed = NegotiationSessionSchema.parse(JSON.parse(line));
+      result.push(parsed);
+    } catch {
+      // Skip malformed session lines
+    }
+  }
+  return result;
+}
+
+async function rewriteSessions(taskId: string, sessions: NegotiationSession[]): Promise<void> {
+  const taskPath = await resolveTaskPathByTaskId(taskId);
+  const taskDir = path.dirname(taskPath);
+  const sessionsDir = path.join(taskDir, "data");
+  await mkdir(sessionsDir, { recursive: true });
+  const sessionsFile = path.join(sessionsDir, "sessions.jsonl");
+  if (sessions.length === 0) {
+    await writeFile(sessionsFile, "", "utf8");
+    return;
+  }
+  const content = sessions.map((s) => JSON.stringify(s)).join("\n") + "\n";
+  await writeFile(sessionsFile, content, "utf8");
 }

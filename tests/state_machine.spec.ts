@@ -8,9 +8,8 @@ describe("state machine", () => {
       frontmatter: {
         task_id: taskId,
         status: "Drafting",
+        hidden: false,
         interaction_type: "online",
-        must_match_tags: ["tagA"],
-        deal_breakers: ["tagZ"],
         current_partner_id: null,
         entered_status_at: "2026-03-03T10:00:00.000Z",
         created_at: "2026-03-03T10:00:00.000Z",
@@ -36,9 +35,8 @@ describe("state machine", () => {
       frontmatter: {
         task_id: taskId,
         status: "Searching",
+        hidden: false,
         interaction_type: "online",
-        must_match_tags: ["tagA"],
-        deal_breakers: ["tagZ"],
         current_partner_id: null,
         entered_status_at: "2026-03-03T10:00:00.000Z",
         created_at: "2026-03-03T10:00:00.000Z",
