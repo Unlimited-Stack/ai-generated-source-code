@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { startTaskAgentRuntime as startRuntime } from "./runtime";
 
 /**

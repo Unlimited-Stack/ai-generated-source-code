@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx ts-node /Users/vibecoding/tests/sqlite_init_test/index.ts)"
+    ]
+  }
+}

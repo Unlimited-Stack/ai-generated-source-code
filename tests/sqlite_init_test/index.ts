@@ -1,39 +1,38 @@
-import Database from 'better-sqlite3';
+import path from "node:path";
+import Database from "better-sqlite3";
 
-// 1. 创建并连接数据库（如果文件不存在，会自动创建）
-const db = new Database('my_database.db', { verbose: console.log });
+const DB_PATH = path.resolve(process.cwd(), ".data/task_agent.db");
+const db = new Database(DB_PATH);
 
-// 2. 创建一个表
-const createTable = `
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-`;
-db.exec(createTable);
+// 1. List all tables
+const tables = db
+  .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+  .all() as { name: string }[];
 
-// 3. 准备插入数据的语句
-const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
-
-// 4. 执行插入（使用事务以确保安全）
-const insertMany = db.transaction((users: {name: string, email: string}[]) => {
-  for (const user of users) insert.run(user.name, user.email);
-});
-
-try {
-    insertMany([
-        { name: 'Alice', email: 'alice@example.com' },
-        { name: 'Bob', email: 'bob@example.com' }
-    ]);
-} catch (err) {
-    console.log("数据可能已存在，跳过插入。");
+console.log(`\n=== task_agent.db tables (${tables.length}) ===`);
+for (const t of tables) {
+  const count = (db.prepare(`SELECT COUNT(*) as c FROM "${t.name}"`).get() as { c: number }).c;
+  console.log(`  ${t.name} : ${count} rows`);
 }
 
-// 5. 查询数据
-const rows = db.prepare('SELECT * FROM users').all();
-console.table(rows);
+// 2. Drop all tables (clean slate)
+console.log("\n=== Dropping all tables ===");
+const dropTxn = db.transaction(() => {
+  for (const t of tables) {
+    db.exec(`DROP TABLE IF EXISTS "${t.name}"`);
+    console.log(`  dropped: ${t.name}`);
+  }
+});
+dropTxn();
 
-// 关闭连接
+// 3. Verify empty
+const remaining = db
+  .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+  .all() as { name: string }[];
+console.log(`\n=== Done. Remaining tables: ${remaining.length} ===`);
+
+// 4. VACUUM to reclaim disk space
+db.exec("VACUUM");
+console.log("VACUUM complete.\n");
+
 db.close();
